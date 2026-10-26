@@ -247,7 +247,8 @@ typedef NS_ENUM(NSInteger, StatusKind) { StatusIdle, StatusUnsaved, StatusWorkin
     self.table.dataSource = self;
     self.table.headerView = nil;
     self.table.rowHeight = 68;
-    self.table.style = NSTableViewStyleSourceList;
+    self.table.style = NSTableViewStyleFullWidth;
+    self.table.backgroundColor = NSColor.controlBackgroundColor;
     self.table.allowsEmptySelection = YES;
     self.table.columnAutoresizingStyle = NSTableViewFirstColumnOnlyAutoresizingStyle;
     self.table.accessibilityLabel = @"Secrets";
@@ -432,6 +433,16 @@ typedef NS_ENUM(NSInteger, StatusKind) { StatusIdle, StatusUnsaved, StatusWorkin
         }
         [title.topAnchor constraintEqualToAnchor:cell.topAnchor constant:12].active = YES;
         [subtitle.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:5].active = YES;
+        NSBox *separator = [[NSBox alloc] init];
+        separator.boxType = NSBoxSeparator;
+        separator.translatesAutoresizingMaskIntoConstraints = NO;
+        [cell addSubview:separator];
+        [NSLayoutConstraint activateConstraints:@[
+            [separator.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:10],
+            [separator.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor constant:-10],
+            [separator.bottomAnchor constraintEqualToAnchor:cell.bottomAnchor],
+            [separator.heightAnchor constraintEqualToConstant:1],
+        ]];
         cell.textField = title;
     }
     cell.textField.stringValue = name;
