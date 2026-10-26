@@ -19,6 +19,6 @@ python3 -m unittest discover -s "${ROOT_DIR}/tests" -p 'test_*.py' -v
 mkdir -p "${TEST_DIR}/NativeTests.app/Contents/MacOS" "${TEST_DIR}/NativeTests.app/Contents/Resources"
 cp "${ROOT_DIR}/scripts/keychain_secrets.py" "${TEST_DIR}/NativeTests.app/Contents/Resources/"
 chmod +x "${TEST_DIR}/NativeTests.app/Contents/Resources/keychain_secrets.py"
-clang -fobjc-arc -Wall -Wextra -Werror -framework Cocoa "${ROOT_DIR}/macos/KeychainSecretsApp.m" -o "${TEST_DIR}/KeychainSecrets"
-clang -fobjc-arc -Wall -Wextra -Werror -framework Cocoa "${ROOT_DIR}/tests/native_tests.m" -o "${TEST_DIR}/NativeTests.app/Contents/MacOS/NativeTests"
+clang -fobjc-arc -Wall -Wextra -Werror -framework Cocoa -framework Security "${ROOT_DIR}/macos/KeychainSecretsApp.m" "${ROOT_DIR}/macos/SecretStore.m" -o "${TEST_DIR}/KeychainSecrets"
+clang -fobjc-arc -Wall -Wextra -Werror -framework Cocoa -framework Security "${ROOT_DIR}/tests/native_tests.m" "${ROOT_DIR}/macos/SecretStore.m" -o "${TEST_DIR}/NativeTests.app/Contents/MacOS/NativeTests"
 "${TEST_DIR}/NativeTests.app/Contents/MacOS/NativeTests"

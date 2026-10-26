@@ -30,7 +30,7 @@ LEGACY_INDEX_PATHS = [
 INDEX_PATH = _resolve_index_path()
 LAUNCH_LABEL = "io.github.zpzjzj.keychain-secrets"
 DEFAULT_KEYCHAIN = Path.home() / "Library" / "Keychains" / "login.keychain-db"
-MACOS_APP_PATH = Path.home() / "Applications" / "KeychainSecrets.app"
+MACOS_APP_PATH = Path.home() / "Applications" / "Clinklet.app"
 
 
 def _migrate_legacy_index() -> None:
@@ -618,10 +618,14 @@ def cmd_install_app(_: argparse.Namespace) -> None:
 
 
 def cmd_app(_: argparse.Namespace) -> None:
-    if not MACOS_APP_PATH.exists():
+    candidates = [MACOS_APP_PATH, Path("/Applications/Clinklet.app"),
+                  Path.home() / "Applications/KeychainSecrets.app", Path("/Applications/KeychainSecrets.app")]
+    app_path = next((path for path in candidates if path.exists()), None)
+    if app_path is None:
         cmd_install_app(argparse.Namespace())
-    subprocess.run(["/usr/bin/open", str(MACOS_APP_PATH)], check=False)
-    print(str(MACOS_APP_PATH))
+        app_path = MACOS_APP_PATH
+    subprocess.run(["/usr/bin/open", str(app_path)], check=False)
+    print(str(app_path))
 
 
 def cmd_stop(_: argparse.Namespace) -> None:

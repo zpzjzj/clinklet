@@ -67,6 +67,18 @@ class CLIContracts(unittest.TestCase):
             args.func(args)
         self.assertEqual(cli.load_index(), self.entry())
 
+    def test_app_prefers_clinklet_installation(self):
+        new_app = Path(self.folder.name) / 'Clinklet.app'
+        with patch.object(cli, 'MACOS_APP_PATH', new_app), patch.object(cli.Path, 'exists', return_value=True), patch.object(cli.subprocess, 'run') as run:
+            cli.cmd_app(argparse.Namespace())
+        self.assertEqual(run.call_args.args[0], ['/usr/bin/open', str(new_app)])
+
+    def test_app_can_open_legacy_installation(self):
+        legacy = Path.home() / 'Applications/KeychainSecrets.app'
+        with patch.object(cli.Path, 'exists', lambda path: path == legacy), patch.object(cli.subprocess, 'run') as run:
+            cli.cmd_app(argparse.Namespace())
+        self.assertEqual(run.call_args.args[0], ['/usr/bin/open', str(legacy)])
+
     def test_existing_subcommands_remain_available(self):
         commands = ['put', 'get', 'export', 'run', 'list', 'info', 'names', 'field', 'update', 'delete', 'app', 'install-app', 'serve', 'open', 'launch', 'stop']
         subparser = next(action for action in cli.build_parser()._actions if isinstance(action, argparse._SubParsersAction))

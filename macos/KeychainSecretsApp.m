@@ -1,56 +1,13 @@
 #import <Cocoa/Cocoa.h>
 
-static NSString *ToolPath(void) {
-    NSString *path = [[[NSBundle mainBundle] resourcePath] stringByAppendingPathComponent:@"keychain_secrets.py"];
-    return path;
-}
+#import "SecretStore.h"
 
-// Always called on a worker queue. Drain both pipes while the child is running.
-static NSString *RunProcess(NSString *path, NSArray<NSString *> *arguments, NSString *stdinText, int *status) {
-    NSTask *task = [[NSTask alloc] init];
-    task.executableURL = [NSURL fileURLWithPath:path];
-    task.arguments = arguments;
-    NSPipe *outPipe = [NSPipe pipe];
-    NSPipe *errPipe = [NSPipe pipe];
-    NSPipe *inPipe = stdinText != nil ? [NSPipe pipe] : nil;
-    task.standardOutput = outPipe;
-    task.standardError = errPipe;
-    task.standardInput = inPipe ?: [NSFileHandle fileHandleWithNullDevice];
-    NSError *error = nil;
-    if (![task launchAndReturnError:&error]) {
-        if (status) *status = -1;
-        return error.localizedDescription ?: @"Unable to start command.";
-    }
-    __block NSData *outData;
-    __block NSData *errData;
-    dispatch_group_t readers = dispatch_group_create();
-    dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
-    dispatch_group_async(readers, queue, ^{ outData = [outPipe.fileHandleForReading readDataToEndOfFile]; });
-    dispatch_group_async(readers, queue, ^{ errData = [errPipe.fileHandleForReading readDataToEndOfFile]; });
-    if (inPipe) {
-        @try {
-            [inPipe.fileHandleForWriting writeData:[stdinText dataUsingEncoding:NSUTF8StringEncoding]];
-        } @catch (NSException *exception) {
-            // The child may reject its arguments before consuming stdin. Its exit status is authoritative.
-        } @finally {
-            [inPipe.fileHandleForWriting closeFile];
-        }
-    }
-    [task waitUntilExit];
-    dispatch_group_wait(readers, DISPATCH_TIME_FOREVER);
-    if (status) *status = task.terminationStatus;
-    NSString *out = [[NSString alloc] initWithData:outData encoding:NSUTF8StringEncoding] ?: @"";
-    NSString *err = [[NSString alloc] initWithData:errData encoding:NSUTF8StringEncoding] ?: @"";
-    return task.terminationStatus != 0 && err.length > 0 ? err : out;
-}
-
-static void RunAsync(NSString *path, NSArray<NSString *> *arguments, NSString *input,
-                     void (^completion)(NSString *, int)) {
+static void RunStore(NSString *(^work)(NSError **), void (^completion)(NSString *, NSError *)) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
-            int status = 0;
-            NSString *output = RunProcess(path, arguments, input, &status);
-            dispatch_async(dispatch_get_main_queue(), ^{ completion(output, status); });
+            NSError *error = nil;
+            NSString *value = work(&error);
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(value, error); });
         }
     });
 }
@@ -112,8 +69,8 @@ static void InstallMainMenu(void) {
 
     NSMenuItem *appMenuItem = [[NSMenuItem alloc] init];
     [mainMenu addItem:appMenuItem];
-    NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"KeychainSecrets"];
-    [appMenu addItemWithTitle:@"Quit KeychainSecrets" action:@selector(terminate:) keyEquivalent:@"q"];
+    NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"Clinklet"];
+    [appMenu addItemWithTitle:@"Quit Clinklet" action:@selector(terminate:) keyEquivalent:@"q"];
     appMenuItem.submenu = appMenu;
 
     NSMenuItem *editMenuItem = [[NSMenuItem alloc] init];
@@ -212,7 +169,7 @@ typedef NS_ENUM(NSInteger, StatusKind) { StatusIdle, StatusUnsaved, StatusWorkin
     self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 1160, 760)
         styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
         backing:NSBackingStoreBuffered defer:NO];
-    self.window.title = @"Keychain Secrets";
+    self.window.title = @"Clinklet";
     self.window.delegate = (id<NSWindowDelegate>)self;
     self.window.minSize = NSMakeSize(1080, 740);
     self.window.titlebarAppearsTransparent = YES;
@@ -688,17 +645,17 @@ typedef NS_ENUM(NSInteger, StatusKind) { StatusIdle, StatusUnsaved, StatusWorkin
         [self showError:@"A secret value is required for a new entry."];
         return;
     }
-    NSArray *arguments = @[(secret.length ? @"put" : @"update"), name, @"--env", envName, @"--service", service,
-                           @"--account", account, @"--note", note, @"--keychain", self.keychainPath ?: DefaultKeychainPath()];
-    if (secret.length) arguments = [arguments arrayByAddingObject:@"--stdin"];
+    NSDictionary *entry = @{@"env": envName, @"service": service, @"account": account,
+                            @"note": note, @"keychain": self.keychainPath ?: DefaultKeychainPath()};
+    NSString *indexPath = IndexPath();
+    BOOL creating = self.editingName == nil;
     [self setWorking:YES message:@"Saving to Keychain…"];
-    RunAsync(ToolPath(), arguments, secret.length ? secret : nil, ^(NSString *output, int status) {
+    RunStore(^NSString *(NSError **error) {
+        SaveSecretEntry(indexPath, name, entry, secret.length ? secret : nil, creating, error);
+        return nil;
+    }, ^(NSString *value __unused, NSError *error) {
         [self setWorking:NO message:@""];
-        if (status != 0) {
-            // Python exceptions can include the security command's arguments. Never show a submitted value.
-            [self showError:secret.length ? @"Could not save the secret. Check Keychain access and try again." : output];
-            return;
-        }
+        if (error) { [self showError:error.localizedDescription]; return; }
         self.dirty = NO;
         self.editingName = name;
         [self refresh:nil];
@@ -718,9 +675,13 @@ typedef NS_ENUM(NSInteger, StatusKind) { StatusIdle, StatusUnsaved, StatusWorkin
     [alert addButtonWithTitle:@"Delete Secret"];
     if ([alert runModal] != NSAlertSecondButtonReturn) return;
     [self setWorking:YES message:@"Deleting from Keychain…"];
-    RunAsync(ToolPath(), @[@"delete", name], nil, ^(NSString *output, int status) {
+    NSString *indexPath = IndexPath();
+    RunStore(^NSString *(NSError **error) {
+        DeleteSecretEntry(indexPath, name, error);
+        return nil;
+    }, ^(NSString *value __unused, NSError *error) {
         [self setWorking:NO message:@""];
-        if (status != 0) { [self showError:output]; return; }
+        if (error) { [self showError:error.localizedDescription]; return; }
         self.dirty = NO;
         [self newEntry:nil];
         [self refresh:nil];
@@ -737,7 +698,7 @@ typedef NS_ENUM(NSInteger, StatusKind) { StatusIdle, StatusUnsaved, StatusWorkin
 - (void)showError:(NSString *)message {
     NSAlert *alert = [[NSAlert alloc] init];
     alert.alertStyle = NSAlertStyleWarning;
-    alert.messageText = @"Keychain Secrets";
+    alert.messageText = @"Clinklet";
     alert.informativeText = message ?: @"Unknown error";
     [self showStatus:message ?: @"Unknown error" kind:StatusError];
     [alert runModal];
@@ -764,12 +725,12 @@ typedef NS_ENUM(NSInteger, StatusKind) { StatusIdle, StatusUnsaved, StatusWorkin
     NSString *keychain = [self field:@"keychain" forName:name fallback:DefaultKeychainPath()];
     NSUInteger generation = self.selectionGeneration;
     [self setWorking:YES message:@"Waiting for Keychain…"];
-    RunAsync(@"/usr/bin/security", @[@"find-generic-password", @"-a", account, @"-s", service, @"-w", keychain], nil, ^(NSString *output, int status) {
+    NSDictionary *entry = @{@"service": service, @"account": account, @"keychain": keychain};
+    RunStore(^NSString *(NSError **error) { return ReadSecretValue(entry, error); }, ^(NSString *output, NSError *error) {
         [self setWorking:NO message:@""];
         if (generation != self.selectionGeneration) return;
-        if (status != 0) { [self showError:output]; return; }
-        // security adds one output newline; preserve significant whitespace in the value.
-        completion([output hasSuffix:@"\n"] ? [output substringToIndex:output.length - 1] : output);
+        if (error) { [self showError:error.localizedDescription]; return; }
+        completion(output);
     });
 }
 

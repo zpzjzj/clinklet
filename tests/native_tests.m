@@ -2,6 +2,26 @@
 #import "../macos/KeychainSecretsApp.m"
 #undef main
 
+static NSString *ToolPath(void) {
+    return [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"keychain_secrets.py"];
+}
+
+// Test-only subprocess helper for CLI interoperability and screenshots.
+static NSString *RunProcess(NSString *path, NSArray *arguments, NSString *input __unused, int *status) {
+    NSTask *task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:path];
+    task.arguments = arguments;
+    NSPipe *pipe = [NSPipe pipe];
+    task.standardOutput = pipe;
+    task.standardError = pipe;
+    NSError *error = nil;
+    if (![task launchAndReturnError:&error]) { *status = -1; return error.localizedDescription; }
+    NSData *data = [pipe.fileHandleForReading readDataToEndOfFile];
+    [task waitUntilExit];
+    *status = task.terminationStatus;
+    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+}
+
 #define CHECK(condition) do { if (!(condition)) { NSLog(@"FAIL line %d: %s", __LINE__, #condition); exit(1); } } while (0)
 
 @interface TestDelegate : AppDelegate
@@ -93,25 +113,16 @@ int main(void) {
         // A slow process must not block the main queue, and completion is delivered on it.
         __block BOOL complete = NO;
         __block BOOL mainQueueRan = NO;
-        RunAsync(@"/bin/sleep", @[@"0.3"], nil, ^(NSString *output, int status) {
-            CHECK(NSThread.isMainThread && status == 0 && output.length == 0 && mainQueueRan);
+        RunStore(^NSString *(NSError **error __unused) {
+            [NSThread sleepForTimeInterval:0.3];
+            return @"done";
+        }, ^(NSString *output, NSError *error) {
+            CHECK(NSThread.isMainThread && error == nil && [output isEqualToString:@"done"] && mainQueueRan);
             complete = YES;
         });
         dispatch_async(dispatch_get_main_queue(), ^{ mainQueueRan = YES; });
         PumpUntil(^BOOL { return complete; }, 5);
-        // More than a pipe buffer on stdout and stderr, including a large stdin payload.
-        NSString *largeInput = [@"payload" stringByPaddingToLength:300000 withString:@"x" startingAtIndex:0];
-        complete = NO;
-        RunAsync(@"/usr/bin/python3", @[@"-c", @"import sys; sys.stdout.write('o'*300000); sys.stderr.write('e'*300000); assert len(sys.stdin.read()) == 300000"], largeInput, ^(NSString *output, int status) {
-            CHECK(status == 0 && output.length == 300000); complete = YES;
-        });
-        PumpUntil(^BOOL { return complete; }, 10);
-        complete = NO;
-        RunAsync(@"/does/not/exist", @[], nil, ^(NSString *output, int status) {
-            CHECK(status != 0 && output.length > 0); complete = YES;
-        });
-        PumpUntil(^BOOL { return complete; }, 5);
-        // Real app save -> bundled, unchanged CLI -> metadata readback; no Keychain access.
+        // Real app save -> Foundation metadata readback, with no Python in the desktop app.
         app.searchField.stringValue = @"";
         [app applySearch];
         [app loadEntry:@"ALPHA"];
@@ -144,12 +155,41 @@ int main(void) {
             int status = 0;
             NSString *output = RunProcess(ToolPath(), @[@"run", @"NATIVE_E2E_SYNTHETIC", @"--", @"/usr/bin/python3", @"-c", @"import os; assert os.environ['NATIVE_E2E_TOKEN'] == '  synthetic-value-with-spaces  '"], nil, &status);
             CHECK(status == 0 && output.length == 0);
-            output = RunProcess(ToolPath(), @[@"delete", @"NATIVE_E2E_SYNTHETIC"], nil, &status);
-            CHECK(status == 0 && [output containsString:@"Deleted"]);
+            // The unchanged CLI can update an item created by the native backend.
+            output = RunProcess(ToolPath(), @[@"put", @"NATIVE_E2E_SYNTHETIC", @"--value", @"synthetic-from-cli", @"--service", @"NATIVE_E2E_SYNTHETIC", @"--keychain", testKeychain], nil, &status);
+            CHECK(status == 0 && [output containsString:@"Stored"]);
+            [app refresh:nil];
+            [app loadEntry:@"NATIVE_E2E_SYNTHETIC"];
+            [app toggleSecret:nil];
+            PumpUntil(^BOOL { return !app.busy; }, 10);
+            CHECK([app.secretVisibleField.stringValue isEqualToString:@"synthetic-from-cli"]);
+            NSError *deleteError = nil;
+            CHECK(DeleteSecretEntry(indexPath, @"NATIVE_E2E_SYNTHETIC", &deleteError) && deleteError == nil);
             [app refresh:nil];
             CHECK(app.metadata[@"NATIVE_E2E_SYNTHETIC"] == nil);
+            NSError *readError = nil;
+            CHECK(ReadSecretValue(@{@"service": @"NATIVE_E2E_SYNTHETIC", @"account": NSUserName(), @"keychain": testKeychain}, &readError) == nil && readError != nil);
             [app newEntry:nil];
             NSLog(@"Isolated Keychain save/reveal/inject/delete passed");
+        }
+        NSError *storeError = nil;
+        NSData *beforeFailure = [NSData dataWithContentsOfFile:indexPath];
+        CHECK(!SaveSecretEntry(indexPath, @"NEW_WITHOUT_VALUE", @{}, nil, YES, &storeError) && storeError != nil);
+        CHECK([[NSData dataWithContentsOfFile:indexPath] isEqualToData:beforeFailure]);
+        storeError = nil;
+        CHECK(!SaveSecretEntry(indexPath, @"ALPHA", @{@"service": @"changed"}, nil, NO, &storeError) && storeError != nil);
+        CHECK([[NSData dataWithContentsOfFile:indexPath] isEqualToData:beforeFailure]);
+        NSDictionary *permissions = [NSFileManager.defaultManager attributesOfItemAtPath:indexPath error:NULL];
+        CHECK(([permissions[NSFilePosixPermissions] unsignedIntegerValue] & 0777) == 0600);
+        CHECK([app.window.title isEqualToString:@"Clinklet"]);
+        NSString *invalidPath = [folder stringByAppendingPathComponent:@"invalid-index.json"];
+        for (NSString *invalid in @[@"not-json", @"[]", @"{\"entry\": 7}"]) {
+            [invalid writeToFile:invalidPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+            NSError *invalidError = nil;
+            CHECK(ReadSecretIndex(invalidPath, &invalidError) == nil && invalidError != nil);
+            invalidError = nil;
+            CHECK(!SaveSecretEntry(invalidPath, @"ENTRY", @{}, nil, YES, &invalidError));
+            CHECK([[NSString stringWithContentsOfFile:invalidPath encoding:NSUTF8StringEncoding error:NULL] isEqualToString:invalid]);
         }
         // Build the in-memory search cache once; keystrokes never call a child process.
         NSMutableDictionary *many = [NSMutableDictionary dictionary];
@@ -163,11 +203,18 @@ int main(void) {
         NSLog(@"10,000-entry search: %.1f ms", -start.timeIntervalSinceNow * 1000);
         CHECK(-start.timeIntervalSinceNow < 1.0);
         // Capture only generated metadata for documentation, in both appearances.
-        [[NSJSONSerialization dataWithJSONObject:fixture options:0 error:NULL] writeToFile:indexPath atomically:YES];
+        NSDictionary *demo = @{
+            @"OpenAI · Personal": @{@"env": @"OPENAI_API_KEY", @"service": @"demo.openai", @"account": @"demo-user", @"note": @"Local coding assistant · development"},
+            @"GitHub · Automation": @{@"env": @"GITHUB_TOKEN", @"service": @"demo.github", @"account": @"demo-user", @"note": @"Repository automation · read-only scope"},
+            @"Staging · Service API": @{@"env": @"STAGING_API_TOKEN", @"service": @"demo.staging", @"account": @"demo-user", @"note": @"Integration tests · staging environment"}
+        };
+        [[NSJSONSerialization dataWithJSONObject:demo options:0 error:NULL] writeToFile:indexPath atomically:YES];
         app.searchField.stringValue = @"";
         [app refresh:nil];
-        [app loadEntry:@"ALPHA"];
+        [app loadEntry:@"OpenAI · Personal"];
+        [app applySearch];
         [app showStatus:@"Changes saved" kind:StatusSuccess];
+        [app.window makeFirstResponder:app.table];
         for (NSString *appearance in @[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]) {
             app.window.appearance = [NSAppearance appearanceNamed:appearance];
             [app.window.contentView layoutSubtreeIfNeeded];

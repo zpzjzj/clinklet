@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_DIR="${KEYCHAIN_SECRETS_APP_DIR:-${HOME}/Applications/KeychainSecrets.app}"
+APP_DIR="${KEYCHAIN_SECRETS_APP_DIR:-${HOME}/Applications/Clinklet.app}"
 mkdir -p "$(dirname "${APP_DIR}")"
 STAGING_DIR="$(mktemp -d "$(dirname "${APP_DIR}")/.keychain-secrets-build.XXXXXX")"
 PREVIOUS_DIR="${STAGING_DIR}/previous.app"
@@ -22,12 +22,10 @@ mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 
 clang \
   -fobjc-arc \
-  -framework Cocoa \
-  "${ROOT_DIR}/macos/KeychainSecretsApp.m" \
+  -framework Cocoa -framework Security \
+  -arch arm64 -arch x86_64 -mmacosx-version-min=13.0 \
+  "${ROOT_DIR}/macos/KeychainSecretsApp.m" "${ROOT_DIR}/macos/SecretStore.m" \
   -o "${BINARY_PATH}"
-
-cp "${ROOT_DIR}/scripts/keychain_secrets.py" "${RESOURCES_DIR}/keychain_secrets.py"
-chmod +x "${RESOURCES_DIR}/keychain_secrets.py"
 
 mkdir -p "${ICONSET_DIR}"
 sips -z 1024 1024 "${ROOT_DIR}/macos/KeychainSecretsIcon.png" --out "${ICONSET_DIR}/icon_512x512@2x.png" >/dev/null
@@ -54,17 +52,17 @@ cat > "${CONTENTS_DIR}/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key>
   <string>io.github.zpzjzj.keychain-secrets</string>
   <key>CFBundleName</key>
-  <string>KeychainSecrets</string>
+  <string>Clinklet</string>
   <key>CFBundleDisplayName</key>
-  <string>KeychainSecrets</string>
+  <string>Clinklet</string>
   <key>CFBundleIconFile</key>
   <string>KeychainSecrets</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.3</string>
+  <string>1.4.0</string>
   <key>CFBundleVersion</key>
-  <string>4</string>
+  <string>5</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>
