@@ -1,0 +1,21 @@
+Clinklet — local keys, simply kept
+
+Requires macOS 13 or later. Supports Apple Silicon and Intel Macs.
+
+1. Drag Clinklet.app to Applications (or to your own ~/Applications folder).
+2. Open Clinklet from Applications.
+
+No Python, Homebrew, Xcode, or other runtime installation is required.
+
+This release is ad-hoc signed for integrity, but is not Developer ID signed or
+notarized. macOS may block the first launch. After attempting to open it, go to
+System Settings > Privacy & Security > Open Anyway, then confirm Open.
+Do not disable Gatekeeper globally.
+
+Upgrading from Keychain Secrets:
+The existing metadata paths, Keychain items and bundle identifier are retained.
+Quit the old app first. You can remove the old application bundle after the
+upgrade; do not remove your Keychain entries or metadata index.
+
+The optional Python CLI remains available in the source repository at
+https://github.com/zpzjzj/clinklet. Its commands and flags are unchanged.

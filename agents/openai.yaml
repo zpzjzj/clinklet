@@ -1,5 +1,5 @@
 interface:
-  display_name: "Keychain Secrets"
+  display_name: "Clinklet"
   short_description: "Store agent secrets in macOS Keychain"
   default_prompt: "Use $keychain-secrets to store and inject an API key for an agent without exposing the value."
 policy:
