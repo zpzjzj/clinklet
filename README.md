@@ -60,6 +60,8 @@ Search names, environment variables, Keychain services/accounts, and notes with 
 
 The native interface includes a two-line entry list, light/dark appearances, empty-result guidance, and operation progress. Keychain operations run in the background; search stays available while an operation is in progress. Editing and switching entries are paused until that operation finishes. The app asks before discarding unsaved edits.
 
+The bottom-right indicator stays hidden while idle. Unsaved changes and errors persist; operations show a spinning circle, and successful actions show a checkmark circle for three seconds. A newer state always takes precedence over an earlier success timer.
+
 Keyboard shortcuts: **⌘F** search, **⌘N** new secret, **⌘S** save, **⌘R** refresh. Existing CLI commands, flags, metadata paths, and Keychain storage remain compatible.
 
 ## Development

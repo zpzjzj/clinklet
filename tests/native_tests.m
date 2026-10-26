@@ -39,6 +39,22 @@ int main(void) {
         [app buildUI];
         [app refresh:nil];
         CHECK(app.names.count == 2);
+        CHECK(app.statusView.hidden);
+        [app showStatus:@"Changes saved" kind:StatusSuccess];
+        CHECK(!app.statusView.hidden && !app.statusIcon.hidden && app.progress.hidden);
+        PumpUntil(^BOOL { return app.statusView.hidden; }, 4);
+        [app showStatus:@"Copied to clipboard" kind:StatusSuccess];
+        app.dirty = YES;
+        [app showStatus:@"Unsaved changes" kind:StatusUnsaved];
+        __block BOOL elapsed = NO;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ elapsed = YES; });
+        PumpUntil(^BOOL { return elapsed; }, 5);
+        CHECK(!app.statusView.hidden && [app.statusLabel.stringValue isEqualToString:@"Unsaved changes"]);
+        [app showStatus:@"Operation failed" kind:StatusError];
+        CHECK(!app.statusView.hidden && !app.statusIcon.hidden);
+        CHECK([app.statusLabel.toolTip isEqualToString:@"Operation failed"]);
+        app.dirty = NO;
+        [app showStatus:@"" kind:StatusIdle];
         for (NSString *query in @[@"alpha", @"MODEL", @"vendor-a", NSUserName(), @"cafe", @"开发", @"model 开发"]) {
             app.searchField.stringValue = query;
             [app applySearch];
@@ -66,6 +82,7 @@ int main(void) {
         CHECK([cell.textField.stringValue isEqualToString:@"ALPHA"]);
         [app setWorking:YES message:@"Testing…"];
         CHECK(!app.actionButtons[0].enabled && !app.noteView.editable);
+        CHECK(!app.statusView.hidden && app.statusIcon.hidden && !app.progress.hidden);
         CHECK(![app tableView:app.table shouldSelectRow:1]);
         app.searchField.stringValue = @"vendor-b";
         [app applySearch];
@@ -150,6 +167,7 @@ int main(void) {
         app.searchField.stringValue = @"";
         [app refresh:nil];
         [app loadEntry:@"ALPHA"];
+        [app showStatus:@"Changes saved" kind:StatusSuccess];
         for (NSString *appearance in @[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]) {
             app.window.appearance = [NSAppearance appearanceNamed:appearance];
             [app.window.contentView layoutSubtreeIfNeeded];

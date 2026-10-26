@@ -141,6 +141,8 @@ static void InstallMainMenu(void) {
     NSApp.mainMenu = mainMenu;
 }
 
+typedef NS_ENUM(NSInteger, StatusKind) { StatusIdle, StatusUnsaved, StatusWorking, StatusSuccess, StatusError };
+
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate>
 @property NSWindow *window;
 @property NSTableView *table;
@@ -164,6 +166,9 @@ static void InstallMainMenu(void) {
 @property NSTextField *emptyLabel;
 @property NSTextField *detailTitle;
 @property NSProgressIndicator *progress;
+@property NSImageView *statusIcon;
+@property NSStackView *statusView;
+@property NSUInteger statusGeneration;
 @property NSArray<NSButton *> *actionButtons;
 @property NSArray<NSString *> *allNames;
 @property NSDictionary<NSString *, NSString *> *searchIndex;
@@ -319,13 +324,21 @@ static void InstallMainMenu(void) {
     self.hintLabel = [NSTextField wrappingLabelWithString:@"Values stay in macOS Keychain. Search uses names and metadata only."];
     self.hintLabel.textColor = NSColor.secondaryLabelColor;
     self.hintLabel.font = [NSFont systemFontOfSize:12];
-    self.statusLabel = [self label:@"Ready" size:12 weight:NSFontWeightMedium];
+    self.statusLabel = [self label:@"" size:12 weight:NSFontWeightMedium];
     self.statusLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     self.progress = [[NSProgressIndicator alloc] init];
     self.progress.style = NSProgressIndicatorStyleSpinning;
     self.progress.controlSize = NSControlSizeSmall;
     self.progress.displayedWhenStopped = NO;
-    NSStackView *status = [self stack:@[self.progress, self.statusLabel] vertical:NO spacing:8];
+    self.statusIcon = [[NSImageView alloc] init];
+    self.statusIcon.imageScaling = NSImageScaleProportionallyDown;
+    [self.statusIcon.widthAnchor constraintEqualToConstant:14].active = YES;
+    [self.statusIcon.heightAnchor constraintEqualToConstant:14].active = YES;
+    [self.progress.widthAnchor constraintEqualToConstant:14].active = YES;
+    [self.progress.heightAnchor constraintEqualToConstant:14].active = YES;
+    self.statusView = [self stack:@[self.progress, self.statusIcon, self.statusLabel] vertical:NO spacing:6];
+    self.statusView.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.statusLabel.widthAnchor constraintLessThanOrEqualToConstant:420].active = YES;
     NSButton *saveButton = [self button:@"Save Changes" action:@selector(save:)];
     saveButton.bezelColor = NSColor.controlAccentColor;
     NSButton *deleteButton = [self button:@"Delete…" action:@selector(deleteEntry:)];
@@ -333,13 +346,13 @@ static void InstallMainMenu(void) {
     NSStackView *actions = [self stack:@[saveButton, deleteButton] vertical:NO spacing:10];
     self.actionButtons = @[newButton, saveButton, deleteButton, refreshButton, self.secretCopyButton, self.secretToggleButton];
 
-    NSStackView *detail = [self stack:@[self.detailTitle, detailSubtitle, fields, noteLabel, noteScroll, self.hintLabel, actions, status] vertical:YES spacing:18];
+    NSStackView *detail = [self stack:@[self.detailTitle, detailSubtitle, fields, noteLabel, noteScroll, self.hintLabel, actions] vertical:YES spacing:18];
     detail.edgeInsets = NSEdgeInsetsMake(26, 26, 26, 26);
     detail.wantsLayer = YES;
     detail.layer.cornerRadius = 16;
 
     detail.translatesAutoresizingMaskIntoConstraints = NO;
-    for (NSView *view in @[fields, noteScroll, self.hintLabel, status]) {
+    for (NSView *view in @[fields, noteScroll, self.hintLabel]) {
         [view.widthAnchor constraintEqualToAnchor:detail.widthAnchor constant:-52].active = YES;
     }
     NSView *content = self.window.contentView;
@@ -354,6 +367,13 @@ static void InstallMainMenu(void) {
     [content addSubview:library];
     [content addSubview:card];
     [content addSubview:detail];
+    [content addSubview:self.statusView];
+    [NSLayoutConstraint activateConstraints:@[
+        [self.statusView.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-24],
+        [self.statusView.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-14],
+        [self.statusView.leadingAnchor constraintGreaterThanOrEqualToAnchor:content.leadingAnchor constant:24],
+        [self.statusView.heightAnchor constraintEqualToConstant:18],
+    ]];
     [NSLayoutConstraint activateConstraints:@[
         [card.leadingAnchor constraintEqualToAnchor:detail.leadingAnchor],
         [card.trailingAnchor constraintEqualToAnchor:detail.trailingAnchor],
@@ -363,11 +383,11 @@ static void InstallMainMenu(void) {
     [NSLayoutConstraint activateConstraints:@[
         [library.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:24],
         [library.topAnchor constraintEqualToAnchor:content.topAnchor constant:24],
-        [library.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-24],
+        [library.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-48],
         [detail.leadingAnchor constraintEqualToAnchor:library.trailingAnchor constant:24],
         [detail.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-24],
         [detail.topAnchor constraintEqualToAnchor:content.topAnchor constant:16],
-        [detail.bottomAnchor constraintLessThanOrEqualToAnchor:content.bottomAnchor constant:-16],
+        [detail.bottomAnchor constraintLessThanOrEqualToAnchor:content.bottomAnchor constant:-48],
     ]];
     [self newEntry:nil];
 }
@@ -444,7 +464,7 @@ static void InstallMainMenu(void) {
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
     if (self.busy) {
-        self.statusLabel.stringValue = @"Wait for the current operation before quitting.";
+        [self showStatus:@"Wait for the current operation before quitting." kind:StatusWorking];
         return NSTerminateCancel;
     }
     return [self confirmDiscard] ? NSTerminateNow : NSTerminateCancel;
@@ -461,14 +481,14 @@ static void InstallMainMenu(void) {
         [self applySearch];
     } else if (!self.loading) {
         self.dirty = YES;
-        self.statusLabel.stringValue = @"Unsaved changes";
+        [self showStatus:@"Unsaved changes" kind:StatusUnsaved];
     }
 }
 
 - (void)textDidChange:(NSNotification *)notification {
     if (!self.loading) {
         self.dirty = YES;
-        self.statusLabel.stringValue = @"Unsaved changes";
+        [self showStatus:@"Unsaved changes" kind:StatusUnsaved];
     }
 }
 
@@ -554,7 +574,7 @@ static void InstallMainMenu(void) {
     self.keychainPath = [self field:@"keychain" forName:name fallback:DefaultKeychainPath()];
     [self resetSecretFields];
     self.noteView.string = [self field:@"note" forName:name fallback:@""];
-    self.statusLabel.stringValue = @"Ready";
+    [self showStatus:@"" kind:StatusIdle];
     self.loading = NO;
     self.dirty = NO;
 }
@@ -574,7 +594,7 @@ static void InstallMainMenu(void) {
     self.keychainPath = DefaultKeychainPath();
     [self resetSecretFields];
     self.noteView.string = @"";
-    self.statusLabel.stringValue = @"Add a name and secret value to get started.";
+    [self showStatus:@"" kind:StatusIdle];
     self.loading = NO;
     self.dirty = NO;
     [self.window makeFirstResponder:self.nameField];
@@ -596,7 +616,32 @@ static void InstallMainMenu(void) {
     }
     self.searchIndex = index;
     [self applySearch];
-    if (sender) self.statusLabel.stringValue = @"Refreshed";
+    if (sender) [self showStatus:@"Refreshed" kind:StatusSuccess];
+}
+
+- (void)showStatus:(NSString *)message kind:(StatusKind)kind {
+    NSUInteger generation = ++self.statusGeneration;
+    self.statusView.hidden = kind == StatusIdle;
+    self.statusLabel.stringValue = message;
+    self.statusLabel.toolTip = message;
+    self.statusLabel.textColor = NSColor.secondaryLabelColor;
+    self.statusIcon.hidden = kind == StatusWorking || kind == StatusIdle;
+    self.progress.hidden = kind != StatusWorking;
+    if (kind == StatusWorking) [self.progress startAnimation:nil]; else [self.progress stopAnimation:nil];
+    NSString *symbol = kind == StatusSuccess ? @"checkmark.circle" : kind == StatusError ? @"exclamationmark.circle" : @"circle.inset.filled";
+    NSColor *color = kind == StatusSuccess ? NSColor.systemGreenColor : kind == StatusError ? NSColor.systemRedColor : NSColor.systemOrangeColor;
+    self.statusIcon.image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:message];
+    self.statusIcon.contentTintColor = color;
+    if (kind == StatusError) self.statusLabel.textColor = NSColor.systemRedColor;
+    if (kind == StatusSuccess) {
+        __weak AppDelegate *weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            AppDelegate *owner = weakSelf;
+            if (owner && owner.statusGeneration == generation) {
+                [owner showStatus:owner.dirty ? @"Unsaved changes" : @"" kind:owner.dirty ? StatusUnsaved : StatusIdle];
+            }
+        });
+    }
 }
 
 - (void)setWorking:(BOOL)working message:(NSString *)message {
@@ -604,8 +649,8 @@ static void InstallMainMenu(void) {
     for (NSButton *button in self.actionButtons) button.enabled = !working;
     for (NSTextField *field in @[self.nameField, self.envField, self.serviceField, self.accountField, self.secretField, self.secretVisibleField]) field.enabled = !working;
     self.noteView.editable = !working;
-    if (working) [self.progress startAnimation:nil]; else [self.progress stopAnimation:nil];
-    self.statusLabel.stringValue = message;
+    [self showStatus:working ? message : (self.dirty ? @"Unsaved changes" : @"")
+                kind:working ? StatusWorking : (self.dirty ? StatusUnsaved : StatusIdle)];
 }
 
 - (IBAction)save:(id)sender {
@@ -637,7 +682,7 @@ static void InstallMainMenu(void) {
     if (secret.length) arguments = [arguments arrayByAddingObject:@"--stdin"];
     [self setWorking:YES message:@"Saving to Keychain…"];
     RunAsync(ToolPath(), arguments, secret.length ? secret : nil, ^(NSString *output, int status) {
-        [self setWorking:NO message:@"Ready"];
+        [self setWorking:NO message:@""];
         if (status != 0) {
             // Python exceptions can include the security command's arguments. Never show a submitted value.
             [self showError:secret.length ? @"Could not save the secret. Check Keychain access and try again." : output];
@@ -647,7 +692,7 @@ static void InstallMainMenu(void) {
         self.editingName = name;
         [self refresh:nil];
         [self loadEntry:name];
-        self.statusLabel.stringValue = @"Changes saved";
+        [self showStatus:@"Changes saved" kind:StatusSuccess];
     });
 }
 
@@ -663,12 +708,12 @@ static void InstallMainMenu(void) {
     if ([alert runModal] != NSAlertSecondButtonReturn) return;
     [self setWorking:YES message:@"Deleting from Keychain…"];
     RunAsync(ToolPath(), @[@"delete", name], nil, ^(NSString *output, int status) {
-        [self setWorking:NO message:@"Ready"];
+        [self setWorking:NO message:@""];
         if (status != 0) { [self showError:output]; return; }
         self.dirty = NO;
         [self newEntry:nil];
         [self refresh:nil];
-        self.statusLabel.stringValue = @"Secret deleted";
+        [self showStatus:@"Secret deleted" kind:StatusSuccess];
     });
 }
 
@@ -683,8 +728,8 @@ static void InstallMainMenu(void) {
     alert.alertStyle = NSAlertStyleWarning;
     alert.messageText = @"Keychain Secrets";
     alert.informativeText = message ?: @"Unknown error";
+    [self showStatus:message ?: @"Unknown error" kind:StatusError];
     [alert runModal];
-    self.statusLabel.stringValue = message ?: @"Unknown error";
 }
 
 - (void)resetSecretFields {
@@ -709,7 +754,7 @@ static void InstallMainMenu(void) {
     NSUInteger generation = self.selectionGeneration;
     [self setWorking:YES message:@"Waiting for Keychain…"];
     RunAsync(@"/usr/bin/security", @[@"find-generic-password", @"-a", account, @"-s", service, @"-w", keychain], nil, ^(NSString *output, int status) {
-        [self setWorking:NO message:@"Ready"];
+        [self setWorking:NO message:@""];
         if (generation != self.selectionGeneration) return;
         if (status != 0) { [self showError:output]; return; }
         // security adds one output newline; preserve significant whitespace in the value.
@@ -742,7 +787,7 @@ static void InstallMainMenu(void) {
         NSPasteboard *pasteboard = NSPasteboard.generalPasteboard;
         [pasteboard clearContents];
         [pasteboard setString:value forType:NSPasteboardTypeString];
-        self.statusLabel.stringValue = @"Copied to clipboard";
+        [self showStatus:@"Copied to clipboard" kind:StatusSuccess];
     }];
 }
 
