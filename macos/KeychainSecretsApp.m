@@ -1,67 +1,15 @@
 #import <Cocoa/Cocoa.h>
 
-static NSString *ToolPath(void) {
-    NSString *path = [[[NSBundle mainBundle] resourcePath] stringByAppendingPathComponent:@"keychain_secrets.py"];
-    return path;
-}
+#import "SecretStore.h"
 
-static NSString *RunTool(NSArray<NSString *> *arguments, NSString *stdinText, int *status) {
-    NSTask *task = [[NSTask alloc] init];
-    task.launchPath = ToolPath();
-    task.arguments = arguments;
-
-    NSPipe *stdoutPipe = [NSPipe pipe];
-    NSPipe *stderrPipe = [NSPipe pipe];
-    task.standardOutput = stdoutPipe;
-    task.standardError = stderrPipe;
-    if (stdinText != nil) {
-        NSPipe *stdinPipe = [NSPipe pipe];
-        task.standardInput = stdinPipe;
-        [task launch];
-        NSData *data = [stdinText dataUsingEncoding:NSUTF8StringEncoding];
-        [[stdinPipe fileHandleForWriting] writeData:data];
-        [[stdinPipe fileHandleForWriting] closeFile];
-    } else {
-        [task launch];
-    }
-    [task waitUntilExit];
-
-    if (status != NULL) {
-        *status = task.terminationStatus;
-    }
-    NSData *outData = [[stdoutPipe fileHandleForReading] readDataToEndOfFile];
-    NSData *errData = [[stderrPipe fileHandleForReading] readDataToEndOfFile];
-    NSString *out = [[NSString alloc] initWithData:outData encoding:NSUTF8StringEncoding] ?: @"";
-    NSString *err = [[NSString alloc] initWithData:errData encoding:NSUTF8StringEncoding] ?: @"";
-    if (task.terminationStatus != 0 && err.length > 0) {
-        return err;
-    }
-    return out;
-}
-
-static NSString *RunSecurity(NSArray<NSString *> *arguments, int *status) {
-    NSTask *task = [[NSTask alloc] init];
-    task.launchPath = @"/usr/bin/security";
-    task.arguments = arguments;
-
-    NSPipe *stdoutPipe = [NSPipe pipe];
-    NSPipe *stderrPipe = [NSPipe pipe];
-    task.standardOutput = stdoutPipe;
-    task.standardError = stderrPipe;
-    [task launch];
-    [task waitUntilExit];
-
-    if (status != NULL) {
-        *status = task.terminationStatus;
-    }
-    NSData *outData = [[stdoutPipe fileHandleForReading] readDataToEndOfFile];
-    NSData *errData = [[stderrPipe fileHandleForReading] readDataToEndOfFile];
-    NSString *out = [[NSString alloc] initWithData:outData encoding:NSUTF8StringEncoding] ?: @"";
-    NSString *err = [[NSString alloc] initWithData:errData encoding:NSUTF8StringEncoding] ?: @"";
-    if (task.terminationStatus != 0 && err.length > 0) {
-        return err;
-    }
-    return out;
+static void RunStore(NSString *(^work)(NSError **), void (^completion)(NSString *, NSError *)) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            NSError *error = nil;
+            NSString *value = work(&error);
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(value, error); });
+        }
+    });
 }
 
 static NSString *DefaultKeychainPath(void) {
@@ -90,11 +38,6 @@ static NSString *IndexPath(void) {
         return legacy;
     }
     return modern;
-}
-
-static BOOL UsesIndexOverride(void) {
-    const char *overridePath = getenv("KEYCHAIN_SECRETS_INDEX_PATH");
-    return overridePath != NULL && strlen(overridePath) > 0;
 }
 
 static NSScreen *PreferredScreen(void) {
@@ -126,8 +69,8 @@ static void InstallMainMenu(void) {
 
     NSMenuItem *appMenuItem = [[NSMenuItem alloc] init];
     [mainMenu addItem:appMenuItem];
-    NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"KeychainSecrets"];
-    [appMenu addItemWithTitle:@"Quit KeychainSecrets" action:@selector(terminate:) keyEquivalent:@"q"];
+    NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"Clinklet"];
+    [appMenu addItemWithTitle:@"Quit Clinklet" action:@selector(terminate:) keyEquivalent:@"q"];
     appMenuItem.submenu = appMenu;
 
     NSMenuItem *editMenuItem = [[NSMenuItem alloc] init];
@@ -140,10 +83,22 @@ static void InstallMainMenu(void) {
     [editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
     [editMenu addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
     [editMenu addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
+    [editMenu addItem:[NSMenuItem separatorItem]];
+    [editMenu addItemWithTitle:@"Find Secret…" action:@selector(focusSearch:) keyEquivalent:@"f"];
     editMenuItem.submenu = editMenu;
+
+    NSMenuItem *fileItem = [[NSMenuItem alloc] init];
+    [mainMenu addItem:fileItem];
+    NSMenu *fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
+    [fileMenu addItemWithTitle:@"New Secret" action:@selector(newEntry:) keyEquivalent:@"n"];
+    [fileMenu addItemWithTitle:@"Save Changes" action:@selector(save:) keyEquivalent:@"s"];
+    [fileMenu addItemWithTitle:@"Refresh" action:@selector(refresh:) keyEquivalent:@"r"];
+    fileItem.submenu = fileMenu;
 
     NSApp.mainMenu = mainMenu;
 }
+
+typedef NS_ENUM(NSInteger, StatusKind) { StatusIdle, StatusUnsaved, StatusWorking, StatusSuccess, StatusError };
 
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate>
 @property NSWindow *window;
@@ -163,6 +118,23 @@ static void InstallMainMenu(void) {
 @property NSTextField *hintLabel;
 @property NSString *keychainPath;
 @property BOOL secretVisible;
+@property NSSearchField *searchField;
+@property NSTextField *countLabel;
+@property NSTextField *emptyLabel;
+@property NSTextField *detailTitle;
+@property NSProgressIndicator *progress;
+@property NSImageView *statusIcon;
+@property NSStackView *statusView;
+@property NSUInteger statusGeneration;
+@property NSArray<NSButton *> *actionButtons;
+@property NSArray<NSString *> *allNames;
+@property NSDictionary<NSString *, NSString *> *searchIndex;
+@property NSString *editingName;
+@property BOOL busy;
+@property BOOL filtering;
+@property BOOL dirty;
+@property BOOL loading;
+@property NSUInteger selectionGeneration;
 @end
 
 @implementation AppDelegate
@@ -179,201 +151,212 @@ static void InstallMainMenu(void) {
     return YES;
 }
 
+- (NSTextField *)label:(NSString *)text size:(CGFloat)size weight:(NSFontWeight)weight {
+    NSTextField *label = [NSTextField labelWithString:text];
+    label.font = [NSFont systemFontOfSize:size weight:weight];
+    return label;
+}
+
+- (NSStackView *)stack:(NSArray<NSView *> *)views vertical:(BOOL)vertical spacing:(CGFloat)spacing {
+    NSStackView *stack = [NSStackView stackViewWithViews:views];
+    stack.orientation = vertical ? NSUserInterfaceLayoutOrientationVertical : NSUserInterfaceLayoutOrientationHorizontal;
+    stack.alignment = vertical ? NSLayoutAttributeLeading : NSLayoutAttributeCenterY;
+    stack.spacing = spacing;
+    return stack;
+}
+
 - (void)buildUI {
-    self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 1180, 680)
-                                             styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
-                                               backing:NSBackingStoreBuffered
-                                                 defer:NO];
-    self.window.title = @"KeychainSecrets";
+    self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 1160, 760)
+        styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
+        backing:NSBackingStoreBuffered defer:NO];
+    self.window.title = @"Clinklet";
+    self.window.delegate = (id<NSWindowDelegate>)self;
+    self.window.minSize = NSMakeSize(1080, 740);
+    self.window.titlebarAppearsTransparent = YES;
+    self.window.backgroundColor = NSColor.windowBackgroundColor;
     NSScreen *screen = PreferredScreen();
-    if (screen != nil) {
-        NSRect visibleFrame = screen.visibleFrame;
+    if (screen) {
         NSRect frame = self.window.frame;
-        frame.origin.x = NSMidX(visibleFrame) - NSWidth(frame) / 2;
-        frame.origin.y = NSMidY(visibleFrame) - NSHeight(frame) / 2;
+        frame.origin = NSMakePoint(NSMidX(screen.visibleFrame) - frame.size.width / 2, NSMidY(screen.visibleFrame) - frame.size.height / 2);
         [self.window setFrame:frame display:NO];
     }
 
-    NSStackView *root = [NSStackView stackViewWithViews:@[]];
-    root.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    root.spacing = 18;
-    root.edgeInsets = NSEdgeInsetsMake(16, 18, 18, 18);
-    root.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.window.contentView addSubview:root];
-    [NSLayoutConstraint activateConstraints:@[
-        [root.leadingAnchor constraintEqualToAnchor:self.window.contentView.leadingAnchor],
-        [root.trailingAnchor constraintEqualToAnchor:self.window.contentView.trailingAnchor],
-        [root.topAnchor constraintEqualToAnchor:self.window.contentView.topAnchor],
-        [root.bottomAnchor constraintEqualToAnchor:self.window.contentView.bottomAnchor],
-    ]];
+    NSTextField *libraryTitle = [self label:@"Your secrets" size:24 weight:NSFontWeightBold];
+    NSTextField *subtitle = [self label:@"Local storage · macOS Keychain" size:12 weight:NSFontWeightRegular];
+    subtitle.textColor = NSColor.secondaryLabelColor;
+    self.searchField = [[NSSearchField alloc] init];
+    self.searchField.placeholderString = @"Search names, variables, notes…";
+    self.searchField.delegate = (id<NSSearchFieldDelegate>)self;
+    self.searchField.sendsSearchStringImmediately = YES;
+    self.searchField.accessibilityLabel = @"Search secrets";
+    self.countLabel = [self label:@"" size:11 weight:NSFontWeightMedium];
+    self.countLabel.textColor = NSColor.secondaryLabelColor;
+    NSButton *newButton = [self button:@"New Secret" action:@selector(newEntry:)];
+    newButton.imagePosition = NSImageLeading;
+    newButton.image = [NSImage imageWithSystemSymbolName:@"plus" accessibilityDescription:nil];
+    NSButton *refreshButton = [self button:@"Refresh" action:@selector(refresh:)];
+    refreshButton.imagePosition = NSImageLeading;
+    refreshButton.image = [NSImage imageWithSystemSymbolName:@"arrow.clockwise" accessibilityDescription:nil];
+    NSStackView *libraryActions = [self stack:@[newButton, refreshButton] vertical:NO spacing:8];
 
     self.table = [[NSTableView alloc] init];
     self.table.delegate = self;
     self.table.dataSource = self;
-    self.table.usesAlternatingRowBackgroundColors = YES;
+    self.table.headerView = nil;
+    self.table.rowHeight = 68;
+    self.table.style = NSTableViewStyleFullWidth;
+    self.table.backgroundColor = NSColor.controlBackgroundColor;
     self.table.allowsEmptySelection = YES;
-    self.table.rowHeight = 24;
-    self.table.intercellSpacing = NSMakeSize(0, 2);
-    self.table.columnAutoresizingStyle = NSTableViewUniformColumnAutoresizingStyle;
-    [self addColumn:@"name" title:@"Name" width:210];
-    [self addColumn:@"env" title:@"Env" width:180];
-    [self addColumn:@"note" title:@"Note" width:220];
-
+    self.table.columnAutoresizingStyle = NSTableViewFirstColumnOnlyAutoresizingStyle;
+    self.table.accessibilityLabel = @"Secrets";
+    NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:@"entry"];
+    column.resizingMask = NSTableColumnAutoresizingMask;
+    [self.table addTableColumn:column];
     NSScrollView *scroll = [[NSScrollView alloc] init];
     scroll.hasVerticalScroller = YES;
-    scroll.hasHorizontalScroller = NO;
+    scroll.drawsBackground = NO;
     scroll.documentView = self.table;
-    scroll.translatesAutoresizingMaskIntoConstraints = NO;
-    [scroll.widthAnchor constraintGreaterThanOrEqualToConstant:560].active = YES;
-    [root addArrangedSubview:scroll];
-
-    NSView *form = [[NSView alloc] init];
-    form.translatesAutoresizingMaskIntoConstraints = NO;
-    [form.widthAnchor constraintGreaterThanOrEqualToConstant:544].active = YES;
-
-    NSView *header = [[NSView alloc] init];
-    header.translatesAutoresizingMaskIntoConstraints = NO;
-    [form addSubview:header];
-
-    NSTextField *title = [NSTextField labelWithString:@"Secret Configuration"];
-    title.font = [NSFont boldSystemFontOfSize:18];
-    title.translatesAutoresizingMaskIntoConstraints = NO;
-    [header addSubview:title];
-
-    NSButton *newButton = [self button:@"New" action:@selector(newEntry:)];
-    NSButton *saveButton = [self button:@"Save" action:@selector(save:)];
-    NSButton *deleteButton = [self button:@"Delete" action:@selector(deleteEntry:)];
-    NSButton *refreshButton = [self button:@"Refresh" action:@selector(refresh:)];
-    NSArray<NSButton *> *buttonViews = @[newButton, saveButton, deleteButton, refreshButton];
-    for (NSButton *button in buttonViews) {
-        button.translatesAutoresizingMaskIntoConstraints = NO;
-        [header addSubview:button];
+    self.emptyLabel = [NSTextField wrappingLabelWithString:@""];
+    self.emptyLabel.textColor = NSColor.secondaryLabelColor;
+    self.emptyLabel.font = [NSFont systemFontOfSize:13];
+    NSStackView *library = [self stack:@[libraryTitle, subtitle, libraryActions, self.searchField, self.countLabel, self.emptyLabel, scroll] vertical:YES spacing:12];
+    library.translatesAutoresizingMaskIntoConstraints = NO;
+    for (NSView *view in @[self.searchField, self.emptyLabel, scroll]) {
+        [view.widthAnchor constraintEqualToAnchor:library.widthAnchor].active = YES;
     }
+    [library.widthAnchor constraintEqualToConstant:380].active = YES;
+    [self.searchField.heightAnchor constraintEqualToConstant:30].active = YES;
+    [scroll.heightAnchor constraintGreaterThanOrEqualToConstant:100].active = YES;
 
+    self.detailTitle = [self label:@"New secret" size:24 weight:NSFontWeightBold];
+    NSTextField *detailSubtitle = [self label:@"Configure a credential for your apps and agents." size:12 weight:NSFontWeightRegular];
+    detailSubtitle.textColor = NSColor.secondaryLabelColor;
     self.nameField = [NSTextField textFieldWithString:@""];
     self.envField = [NSTextField textFieldWithString:@""];
     self.serviceField = [NSTextField textFieldWithString:@""];
     self.accountField = [NSTextField textFieldWithString:NSUserName()];
     self.secretField = [NSSecureTextField textFieldWithString:@""];
-    self.secretField.placeholderString = @"Leave blank to keep existing secret";
     self.secretVisibleField = [NSTextField textFieldWithString:@""];
-    self.secretVisibleField.placeholderString = @"Leave blank to keep existing secret";
     self.secretVisibleField.hidden = YES;
     self.secretToggleButton = [self button:@"Show" action:@selector(toggleSecret:)];
     self.secretCopyButton = [self button:@"Copy" action:@selector(copySecret:)];
-    for (NSView *view in @[self.nameField, self.envField, self.serviceField, self.accountField, self.secretField, self.secretVisibleField]) {
-        view.menu = TextEditingMenu();
+    for (NSTextField *field in @[self.nameField, self.envField, self.serviceField, self.accountField, self.secretField, self.secretVisibleField]) {
+        field.menu = TextEditingMenu();
+        field.delegate = (id<NSTextFieldDelegate>)self;
+        field.font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightRegular];
+        field.lineBreakMode = NSLineBreakByTruncatingTail;
     }
+    self.nameField.placeholderString = @"e.g. OPENAI_API_KEY";
+    self.envField.placeholderString = @"Defaults to the secret name";
+    self.serviceField.placeholderString = @"Defaults to the secret name";
+    self.accountField.placeholderString = @"Keychain account";
+    self.secretField.placeholderString = @"Leave blank to keep the stored value";
+    self.secretVisibleField.placeholderString = self.secretField.placeholderString;
+    NSStackView *secretInput = [self stack:@[self.secretField, self.secretVisibleField, self.secretCopyButton, self.secretToggleButton] vertical:NO spacing:6];
+    [self.secretField.widthAnchor constraintEqualToAnchor:self.secretVisibleField.widthAnchor].active = YES;
+    [self.secretField.widthAnchor constraintGreaterThanOrEqualToConstant:160].active = YES;
+    [self.secretField setContentHuggingPriority:200 forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [self.secretVisibleField setContentHuggingPriority:200 forOrientation:NSLayoutConstraintOrientationHorizontal];
+    NSStackView *fields = [self stack:@[
+        [self row:@"Name" input:self.nameField],
+        [self row:@"Environment" input:self.envField],
+        [self row:@"Secret value" input:secretInput],
+        [self row:@"Service" input:self.serviceField],
+        [self row:@"Account" input:self.accountField]
+    ] vertical:YES spacing:14];
+    for (NSView *row in fields.arrangedSubviews) [row.widthAnchor constraintEqualToAnchor:fields.widthAnchor].active = YES;
+
+    NSTextField *noteLabel = [self label:@"NOTES" size:11 weight:NSFontWeightSemibold];
+    noteLabel.textColor = NSColor.secondaryLabelColor;
     self.noteView = [[NSTextView alloc] init];
     self.noteView.font = [NSFont systemFontOfSize:13];
+    self.noteView.richText = NO;
+    self.noteView.textContainerInset = NSMakeSize(10, 10);
+    self.noteView.delegate = (id<NSTextViewDelegate>)self;
     self.noteView.menu = TextEditingMenu();
-
-    NSStackView *fields = [NSStackView stackViewWithViews:@[
-        [self row:@"Name" field:self.nameField],
-        [self row:@"Environment variable" field:self.envField],
-        [self row:@"Keychain service" field:self.serviceField],
-        [self row:@"Keychain account" field:self.accountField],
-        [self secretRow],
-    ]];
-    fields.orientation = NSUserInterfaceLayoutOrientationVertical;
-    fields.alignment = NSLayoutAttributeLeading;
-    fields.spacing = 10;
-    fields.translatesAutoresizingMaskIntoConstraints = NO;
-    [form addSubview:fields];
-
     NSScrollView *noteScroll = [[NSScrollView alloc] init];
     noteScroll.hasVerticalScroller = YES;
     noteScroll.borderType = NSBezelBorder;
     noteScroll.documentView = self.noteView;
-    noteScroll.translatesAutoresizingMaskIntoConstraints = NO;
-
-    NSTextField *noteLabel = [NSTextField labelWithString:@"Note"];
-    noteLabel.font = [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
-    noteLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [form addSubview:noteLabel];
-    [form addSubview:noteScroll];
-
-    self.hintLabel = [NSTextField wrappingLabelWithString:@"Secret values are stored in macOS Keychain. This app stores only metadata in ~/Library/Application Support/KeychainSecrets/index.json."];
+    [noteScroll.heightAnchor constraintEqualToConstant:112].active = YES;
+    self.hintLabel = [NSTextField wrappingLabelWithString:@"Values stay in macOS Keychain. Search uses names and metadata only."];
     self.hintLabel.textColor = NSColor.secondaryLabelColor;
-    self.hintLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [form addSubview:self.hintLabel];
+    self.hintLabel.font = [NSFont systemFontOfSize:12];
+    self.statusLabel = [self label:@"" size:12 weight:NSFontWeightMedium];
+    self.statusLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    self.progress = [[NSProgressIndicator alloc] init];
+    self.progress.style = NSProgressIndicatorStyleSpinning;
+    self.progress.controlSize = NSControlSizeSmall;
+    self.progress.displayedWhenStopped = NO;
+    self.statusIcon = [[NSImageView alloc] init];
+    self.statusIcon.imageScaling = NSImageScaleProportionallyDown;
+    [self.statusIcon.widthAnchor constraintEqualToConstant:14].active = YES;
+    [self.statusIcon.heightAnchor constraintEqualToConstant:14].active = YES;
+    [self.progress.widthAnchor constraintEqualToConstant:14].active = YES;
+    [self.progress.heightAnchor constraintEqualToConstant:14].active = YES;
+    self.statusView = [self stack:@[self.progress, self.statusIcon, self.statusLabel] vertical:NO spacing:6];
+    self.statusView.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.statusLabel.widthAnchor constraintLessThanOrEqualToConstant:420].active = YES;
+    NSButton *saveButton = [self button:@"Save Changes" action:@selector(save:)];
+    saveButton.bezelColor = NSColor.controlAccentColor;
+    NSButton *deleteButton = [self button:@"Delete…" action:@selector(deleteEntry:)];
+    deleteButton.contentTintColor = NSColor.systemRedColor;
+    NSStackView *actions = [self stack:@[saveButton, deleteButton] vertical:NO spacing:10];
+    self.actionButtons = @[newButton, saveButton, deleteButton, refreshButton, self.secretCopyButton, self.secretToggleButton];
 
-    self.statusLabel = [NSTextField labelWithString:@""];
-    self.statusLabel.textColor = NSColor.secondaryLabelColor;
-    self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [form addSubview:self.statusLabel];
+    NSStackView *detail = [self stack:@[self.detailTitle, detailSubtitle, fields, noteLabel, noteScroll, self.hintLabel, actions] vertical:YES spacing:18];
+    detail.edgeInsets = NSEdgeInsetsMake(26, 26, 26, 26);
+    detail.wantsLayer = YES;
+    detail.layer.cornerRadius = 16;
 
-    CGFloat panelPadding = 8;
+    detail.translatesAutoresizingMaskIntoConstraints = NO;
+    for (NSView *view in @[fields, noteScroll, self.hintLabel]) {
+        [view.widthAnchor constraintEqualToAnchor:detail.widthAnchor constant:-52].active = YES;
+    }
+    NSView *content = self.window.contentView;
+    NSVisualEffectView *card = [[NSVisualEffectView alloc] init];
+    card.material = NSVisualEffectMaterialContentBackground;
+    card.blendingMode = NSVisualEffectBlendingModeWithinWindow;
+    card.state = NSVisualEffectStateActive;
+    card.wantsLayer = YES;
+    card.layer.cornerRadius = 16;
+    card.layer.masksToBounds = YES;
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    [content addSubview:library];
+    [content addSubview:card];
+    [content addSubview:detail];
+    [content addSubview:self.statusView];
     [NSLayoutConstraint activateConstraints:@[
-        [header.leadingAnchor constraintEqualToAnchor:form.leadingAnchor constant:panelPadding],
-        [header.trailingAnchor constraintEqualToAnchor:form.trailingAnchor constant:-panelPadding],
-        [header.topAnchor constraintEqualToAnchor:form.topAnchor constant:2],
-        [header.heightAnchor constraintEqualToConstant:34],
-
-        [title.leadingAnchor constraintEqualToAnchor:header.leadingAnchor],
-        [title.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
-        [title.trailingAnchor constraintLessThanOrEqualToAnchor:newButton.leadingAnchor constant:-14],
-
-        [refreshButton.trailingAnchor constraintEqualToAnchor:header.trailingAnchor],
-        [refreshButton.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
-        [deleteButton.trailingAnchor constraintEqualToAnchor:refreshButton.leadingAnchor constant:-8],
-        [deleteButton.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
-        [saveButton.trailingAnchor constraintEqualToAnchor:deleteButton.leadingAnchor constant:-8],
-        [saveButton.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
-        [newButton.trailingAnchor constraintEqualToAnchor:saveButton.leadingAnchor constant:-8],
-        [newButton.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
-
-        [fields.leadingAnchor constraintEqualToAnchor:form.leadingAnchor constant:panelPadding],
-        [fields.trailingAnchor constraintEqualToAnchor:form.trailingAnchor constant:-panelPadding],
-        [fields.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:18],
-
-        [noteLabel.leadingAnchor constraintEqualToAnchor:form.leadingAnchor constant:panelPadding],
-        [noteLabel.topAnchor constraintEqualToAnchor:fields.bottomAnchor constant:14],
-        [noteLabel.trailingAnchor constraintEqualToAnchor:form.trailingAnchor constant:-panelPadding],
-
-        [noteScroll.leadingAnchor constraintEqualToAnchor:form.leadingAnchor constant:panelPadding],
-        [noteScroll.trailingAnchor constraintEqualToAnchor:form.trailingAnchor constant:-panelPadding],
-        [noteScroll.topAnchor constraintEqualToAnchor:noteLabel.bottomAnchor constant:4],
-        [noteScroll.heightAnchor constraintEqualToConstant:130],
-
-        [self.hintLabel.leadingAnchor constraintEqualToAnchor:form.leadingAnchor constant:panelPadding],
-        [self.hintLabel.trailingAnchor constraintEqualToAnchor:form.trailingAnchor constant:-panelPadding],
-        [self.hintLabel.topAnchor constraintEqualToAnchor:noteScroll.bottomAnchor constant:16],
-
-        [self.statusLabel.leadingAnchor constraintEqualToAnchor:form.leadingAnchor constant:panelPadding],
-        [self.statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:form.trailingAnchor constant:-panelPadding],
-        [self.statusLabel.topAnchor constraintEqualToAnchor:self.hintLabel.bottomAnchor constant:10],
+        [self.statusView.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-24],
+        [self.statusView.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-14],
+        [self.statusView.leadingAnchor constraintGreaterThanOrEqualToAnchor:content.leadingAnchor constant:24],
+        [self.statusView.heightAnchor constraintEqualToConstant:18],
     ]];
-    [root addArrangedSubview:form];
+    [NSLayoutConstraint activateConstraints:@[
+        [card.leadingAnchor constraintEqualToAnchor:detail.leadingAnchor],
+        [card.trailingAnchor constraintEqualToAnchor:detail.trailingAnchor],
+        [card.topAnchor constraintEqualToAnchor:detail.topAnchor],
+        [card.bottomAnchor constraintEqualToAnchor:detail.bottomAnchor],
+    ]];
+    [NSLayoutConstraint activateConstraints:@[
+        [library.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:24],
+        [library.topAnchor constraintEqualToAnchor:content.topAnchor constant:24],
+        [library.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-48],
+        [detail.leadingAnchor constraintEqualToAnchor:library.trailingAnchor constant:24],
+        [detail.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-24],
+        [detail.topAnchor constraintEqualToAnchor:content.topAnchor constant:16],
+        [detail.bottomAnchor constraintLessThanOrEqualToAnchor:content.bottomAnchor constant:-48],
+    ]];
     [self newEntry:nil];
 }
 
-- (void)addColumn:(NSString *)identifier title:(NSString *)title width:(CGFloat)width {
-    NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:identifier];
-    column.title = title;
-    column.width = width;
-    [self.table addTableColumn:column];
-}
-
-- (NSView *)row:(NSString *)label field:(NSTextField *)field {
-    NSView *row = [[NSView alloc] init];
-    row.translatesAutoresizingMaskIntoConstraints = NO;
-    NSTextField *labelView = [NSTextField labelWithString:label];
-    labelView.font = [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
-    labelView.translatesAutoresizingMaskIntoConstraints = NO;
-    field.placeholderString = label;
-    field.translatesAutoresizingMaskIntoConstraints = NO;
-    [row addSubview:labelView];
-    [row addSubview:field];
-    [NSLayoutConstraint activateConstraints:@[
-        [row.heightAnchor constraintEqualToConstant:34],
-        [labelView.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
-        [labelView.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [labelView.widthAnchor constraintEqualToConstant:142],
-        [field.leadingAnchor constraintEqualToAnchor:labelView.trailingAnchor constant:12],
-        [field.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [field.widthAnchor constraintEqualToConstant:390],
-    ]];
+- (NSView *)row:(NSString *)label input:(NSView *)input {
+    NSTextField *caption = [self label:label size:12 weight:NSFontWeightMedium];
+    caption.textColor = NSColor.secondaryLabelColor;
+    [caption.widthAnchor constraintEqualToConstant:100].active = YES;
+    NSStackView *row = [self stack:@[caption, input] vertical:NO spacing:12];
+    [input setContentHuggingPriority:200 forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [input.widthAnchor constraintEqualToAnchor:row.widthAnchor constant:-112].active = YES;
     return row;
 }
 
@@ -383,101 +366,146 @@ static void InstallMainMenu(void) {
     return button;
 }
 
-- (NSView *)secretRow {
-    NSView *row = [[NSView alloc] init];
-    row.translatesAutoresizingMaskIntoConstraints = NO;
-
-    NSTextField *labelView = [NSTextField labelWithString:@"Secret value"];
-    labelView.font = [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
-    labelView.translatesAutoresizingMaskIntoConstraints = NO;
-    [row addSubview:labelView];
-
-    NSView *inputRow = [[NSView alloc] init];
-    inputRow.translatesAutoresizingMaskIntoConstraints = NO;
-    self.secretField.translatesAutoresizingMaskIntoConstraints = NO;
-    self.secretVisibleField.translatesAutoresizingMaskIntoConstraints = NO;
-    self.secretToggleButton.translatesAutoresizingMaskIntoConstraints = NO;
-    self.secretCopyButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [inputRow addSubview:self.secretField];
-    [inputRow addSubview:self.secretVisibleField];
-    [inputRow addSubview:self.secretToggleButton];
-    [inputRow addSubview:self.secretCopyButton];
-    [row addSubview:inputRow];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [row.heightAnchor constraintEqualToConstant:34],
-        [labelView.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
-        [labelView.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [labelView.widthAnchor constraintEqualToConstant:142],
-        [inputRow.leadingAnchor constraintEqualToAnchor:labelView.trailingAnchor constant:12],
-        [inputRow.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [inputRow.widthAnchor constraintEqualToConstant:390],
-        [inputRow.heightAnchor constraintEqualToConstant:30],
-        [self.secretToggleButton.trailingAnchor constraintEqualToAnchor:inputRow.trailingAnchor],
-        [self.secretToggleButton.centerYAnchor constraintEqualToAnchor:inputRow.centerYAnchor],
-        [self.secretToggleButton.widthAnchor constraintEqualToConstant:72],
-        [self.secretCopyButton.trailingAnchor constraintEqualToAnchor:self.secretToggleButton.leadingAnchor constant:-8],
-        [self.secretCopyButton.centerYAnchor constraintEqualToAnchor:inputRow.centerYAnchor],
-        [self.secretCopyButton.widthAnchor constraintEqualToConstant:72],
-
-        [self.secretField.leadingAnchor constraintEqualToAnchor:inputRow.leadingAnchor],
-        [self.secretField.trailingAnchor constraintEqualToAnchor:self.secretCopyButton.leadingAnchor constant:-8],
-        [self.secretField.centerYAnchor constraintEqualToAnchor:inputRow.centerYAnchor],
-
-        [self.secretVisibleField.leadingAnchor constraintEqualToAnchor:inputRow.leadingAnchor],
-        [self.secretVisibleField.trailingAnchor constraintEqualToAnchor:self.secretCopyButton.leadingAnchor constant:-8],
-        [self.secretVisibleField.centerYAnchor constraintEqualToAnchor:inputRow.centerYAnchor],
-    ]];
-    return row;
-}
-
 - (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView {
     return self.names.count;
 }
 
 - (NSView *)tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row {
     NSString *name = self.names[row];
-    NSString *identifier = tableColumn.identifier;
-    NSString *value = name;
-    if ([identifier isEqualToString:@"env"]) {
-        value = [self field:@"env" forName:name fallback:name];
-    } else if ([identifier isEqualToString:@"note"]) {
-        value = [self field:@"note" forName:name fallback:@""];
+    NSTableCellView *cell = [tableView makeViewWithIdentifier:@"entry" owner:self];
+    if (!cell) {
+        cell = [[NSTableCellView alloc] init];
+        cell.identifier = @"entry";
+        NSTextField *title = [self label:@"" size:13 weight:NSFontWeightSemibold];
+        NSTextField *subtitle = [self label:@"" size:11 weight:NSFontWeightRegular];
+        subtitle.textColor = NSColor.secondaryLabelColor;
+        title.tag = 1;
+        subtitle.tag = 2;
+        for (NSTextField *label in @[title, subtitle]) {
+            label.lineBreakMode = NSLineBreakByTruncatingTail;
+            label.translatesAutoresizingMaskIntoConstraints = NO;
+            [cell addSubview:label];
+            [label.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:10].active = YES;
+            [label.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor constant:-10].active = YES;
+        }
+        [title.topAnchor constraintEqualToAnchor:cell.topAnchor constant:12].active = YES;
+        [subtitle.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:5].active = YES;
+        NSBox *separator = [[NSBox alloc] init];
+        separator.boxType = NSBoxSeparator;
+        separator.translatesAutoresizingMaskIntoConstraints = NO;
+        [cell addSubview:separator];
+        [NSLayoutConstraint activateConstraints:@[
+            [separator.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:10],
+            [separator.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor constant:-10],
+            [separator.bottomAnchor constraintEqualToAnchor:cell.bottomAnchor],
+            [separator.heightAnchor constraintEqualToConstant:1],
+        ]];
+        cell.textField = title;
     }
-    NSTableCellView *cell = [[NSTableCellView alloc] init];
-    NSTextField *text = [NSTextField labelWithString:value ?: @""];
-    text.font = [NSFont systemFontOfSize:13];
-    text.lineBreakMode = NSLineBreakByTruncatingTail;
-    text.translatesAutoresizingMaskIntoConstraints = NO;
-    [cell addSubview:text];
-    [NSLayoutConstraint activateConstraints:@[
-        [text.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:6],
-        [text.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor constant:-6],
-        [text.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
-    ]];
+    cell.textField.stringValue = name;
+    NSString *env = [self field:@"env" forName:name fallback:name];
+    NSString *note = [self field:@"note" forName:name fallback:@""];
+    ((NSTextField *)[cell viewWithTag:2]).stringValue = note.length ? [NSString stringWithFormat:@"%@ · %@", env, note] : env;
+    cell.toolTip = [NSString stringWithFormat:@"%@\n%@\n%@", name, env, note];
     return cell;
 }
 
-- (void)tableViewSelectionDidChange:(NSNotification *)notification {
-    NSInteger row = self.table.selectedRow;
-    if (row < 0 || row >= self.names.count) {
-        return;
-    }
-    [self loadEntry:self.names[row]];
+- (BOOL)tableView:(NSTableView *)tableView shouldSelectRow:(NSInteger)row {
+    return !self.busy && [self confirmDiscard];
 }
 
-- (void)loadMetadata {
+- (void)tableViewSelectionDidChange:(NSNotification *)notification {
+    if (self.filtering || self.busy) return;
+    NSInteger row = self.table.selectedRow;
+    if (row >= 0 && (NSUInteger)row < self.names.count) [self loadEntry:self.names[row]];
+}
+
+- (BOOL)confirmDiscard {
+    if (!self.dirty) return YES;
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"Discard unsaved changes?";
+    alert.informativeText = @"Your changes have not been saved to Keychain.";
+    [alert addButtonWithTitle:@"Keep Editing"];
+    [alert addButtonWithTitle:@"Discard Changes"];
+    return [alert runModal] == NSAlertSecondButtonReturn;
+}
+
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
+    if (self.busy) {
+        [self showStatus:@"Wait for the current operation before quitting." kind:StatusWorking];
+        return NSTerminateCancel;
+    }
+    return [self confirmDiscard] ? NSTerminateNow : NSTerminateCancel;
+}
+
+- (BOOL)windowShouldClose:(NSWindow *)sender {
+    if (self.busy || ![self confirmDiscard]) return NO;
+    self.dirty = NO;
+    return YES;
+}
+
+- (void)controlTextDidChange:(NSNotification *)notification {
+    if (notification.object == self.searchField) {
+        [self applySearch];
+    } else if (!self.loading) {
+        self.dirty = YES;
+        [self showStatus:@"Unsaved changes" kind:StatusUnsaved];
+    }
+}
+
+- (void)textDidChange:(NSNotification *)notification {
+    if (!self.loading) {
+        self.dirty = YES;
+        [self showStatus:@"Unsaved changes" kind:StatusUnsaved];
+    }
+}
+
+- (IBAction)focusSearch:(id)sender {
+    [self.window makeFirstResponder:self.searchField];
+    [self.searchField selectText:nil];
+}
+
+- (void)applySearch {
+    NSArray<NSString *> *tokens = [Trim(self.searchField.stringValue) componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    self.filtering = YES;
+    [self.names removeAllObjects];
+    for (NSString *name in self.allNames) {
+        NSString *text = self.searchIndex[name];
+        BOOL matches = YES;
+        for (NSString *token in tokens) {
+            if (token.length && [text rangeOfString:token options:(NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch)].location == NSNotFound) {
+                matches = NO;
+                break;
+            }
+        }
+        if (matches) [self.names addObject:name];
+    }
+    [self.table deselectAll:nil];
+    [self.table reloadData];
+    NSUInteger selected = self.editingName ? [self.names indexOfObject:self.editingName] : NSNotFound;
+    if (selected != NSNotFound) [self.table selectRowIndexes:[NSIndexSet indexSetWithIndex:selected] byExtendingSelection:NO];
+    self.filtering = NO;
+    self.countLabel.stringValue = [NSString stringWithFormat:@"%lu of %lu secrets", (unsigned long)self.names.count, (unsigned long)self.allNames.count];
+    self.emptyLabel.hidden = self.names.count > 0;
+    self.emptyLabel.stringValue = self.allNames.count ? @"No matching secrets. Try another name, variable, or note." : @"Your vault is ready. Add your first secret to get started.";
+}
+
+- (BOOL)loadMetadata {
     NSData *data = [NSData dataWithContentsOfFile:IndexPath()];
     if (data == nil) {
+        if ([[NSFileManager defaultManager] fileExistsAtPath:IndexPath()]) {
+            [self showError:@"Unable to read the metadata index. Check the file permissions and refresh."];
+            return NO;
+        }
         self.metadata = @{};
-        return;
+        return YES;
     }
 
     NSError *error = nil;
     id object = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
     if (![object isKindOfClass:[NSDictionary class]]) {
-        self.metadata = @{};
-        return;
+        [self showError:@"The metadata index is invalid. Restore a valid JSON index and refresh."];
+        return NO;
     }
 
     NSMutableDictionary<NSString *, NSDictionary *> *metadata = [NSMutableDictionary dictionary];
@@ -489,6 +517,7 @@ static void InstallMainMenu(void) {
         }
     }
     self.metadata = metadata;
+    return YES;
 }
 
 - (NSString *)field:(NSString *)field forName:(NSString *)name fallback:(NSString *)fallback {
@@ -501,6 +530,10 @@ static void InstallMainMenu(void) {
 }
 
 - (void)loadEntry:(NSString *)name {
+    self.loading = YES;
+    self.selectionGeneration++;
+    self.editingName = name;
+    self.detailTitle.stringValue = @"Secret details";
     self.nameField.stringValue = name;
     self.nameField.editable = NO;
     self.envField.stringValue = [self field:@"env" forName:name fallback:name];
@@ -509,10 +542,17 @@ static void InstallMainMenu(void) {
     self.keychainPath = [self field:@"keychain" forName:name fallback:DefaultKeychainPath()];
     [self resetSecretFields];
     self.noteView.string = [self field:@"note" forName:name fallback:@""];
-    self.statusLabel.stringValue = [NSString stringWithFormat:@"Loaded %@", name];
+    [self showStatus:@"" kind:StatusIdle];
+    self.loading = NO;
+    self.dirty = NO;
 }
 
 - (IBAction)newEntry:(id)sender {
+    if (self.busy || ![self confirmDiscard]) return;
+    self.loading = YES;
+    self.selectionGeneration++;
+    self.editingName = nil;
+    self.detailTitle.stringValue = @"New secret";
     [self.table deselectAll:nil];
     self.nameField.editable = YES;
     self.nameField.stringValue = @"";
@@ -522,31 +562,67 @@ static void InstallMainMenu(void) {
     self.keychainPath = DefaultKeychainPath();
     [self resetSecretFields];
     self.noteView.string = @"";
-    self.statusLabel.stringValue = @"New entry";
+    [self showStatus:@"" kind:StatusIdle];
+    self.loading = NO;
+    self.dirty = NO;
+    [self.window makeFirstResponder:self.nameField];
 }
 
 - (IBAction)refresh:(id)sender {
-    NSString *selectedName = Trim(self.nameField.stringValue);
-    [self loadMetadata];
-    [self.names removeAllObjects];
-    NSArray<NSString *> *sortedNames = [self.metadata.allKeys sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
-    [self.names addObjectsFromArray:sortedNames];
-    [self.table reloadData];
-    NSClipView *clipView = self.table.enclosingScrollView.contentView;
-    [clipView scrollToPoint:NSMakePoint(0, clipView.bounds.origin.y)];
-    [self.table.enclosingScrollView reflectScrolledClipView:clipView];
-    if (selectedName.length > 0) {
-        NSUInteger index = [self.names indexOfObject:selectedName];
-        if (index != NSNotFound) {
-            [self.table selectRowIndexes:[NSIndexSet indexSetWithIndex:index] byExtendingSelection:NO];
-        }
-    } else if (UsesIndexOverride() && self.names.count > 0) {
-        [self.table selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
+    if (self.busy || (sender && ![self confirmDiscard])) return;
+    if (![self loadMetadata]) return;
+    if (sender) {
+        if (self.editingName && self.metadata[self.editingName]) [self loadEntry:self.editingName];
+        else { self.dirty = NO; [self newEntry:nil]; }
     }
-    self.statusLabel.stringValue = @"Refreshed";
+    self.allNames = [self.metadata.allKeys sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+    NSMutableDictionary *index = [NSMutableDictionary dictionary];
+    for (NSString *name in self.allNames) {
+        NSMutableArray *parts = [NSMutableArray arrayWithObject:name];
+        for (NSString *field in @[@"env", @"service", @"account", @"note"]) [parts addObject:[self field:field forName:name fallback:@""]];
+        index[name] = [parts componentsJoinedByString:@"\n"];
+    }
+    self.searchIndex = index;
+    [self applySearch];
+    if (sender) [self showStatus:@"Refreshed" kind:StatusSuccess];
+}
+
+- (void)showStatus:(NSString *)message kind:(StatusKind)kind {
+    NSUInteger generation = ++self.statusGeneration;
+    self.statusView.hidden = kind == StatusIdle;
+    self.statusLabel.stringValue = message;
+    self.statusLabel.toolTip = message;
+    self.statusLabel.textColor = NSColor.secondaryLabelColor;
+    self.statusIcon.hidden = kind == StatusWorking || kind == StatusIdle;
+    self.progress.hidden = kind != StatusWorking;
+    if (kind == StatusWorking) [self.progress startAnimation:nil]; else [self.progress stopAnimation:nil];
+    NSString *symbol = kind == StatusSuccess ? @"checkmark.circle" : kind == StatusError ? @"exclamationmark.circle" : @"circle.inset.filled";
+    NSColor *color = kind == StatusSuccess ? NSColor.systemGreenColor : kind == StatusError ? NSColor.systemRedColor : NSColor.systemOrangeColor;
+    self.statusIcon.image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:message];
+    self.statusIcon.contentTintColor = color;
+    if (kind == StatusError) self.statusLabel.textColor = NSColor.systemRedColor;
+    if (kind == StatusSuccess) {
+        __weak AppDelegate *weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            AppDelegate *owner = weakSelf;
+            if (owner && owner.statusGeneration == generation) {
+                [owner showStatus:owner.dirty ? @"Unsaved changes" : @"" kind:owner.dirty ? StatusUnsaved : StatusIdle];
+            }
+        });
+    }
+}
+
+- (void)setWorking:(BOOL)working message:(NSString *)message {
+    self.busy = working;
+    for (NSButton *button in self.actionButtons) button.enabled = !working;
+    for (NSTextField *field in @[self.nameField, self.envField, self.serviceField, self.accountField, self.secretField, self.secretVisibleField]) field.enabled = !working;
+    self.noteView.editable = !working;
+    [self showStatus:working ? message : (self.dirty ? @"Unsaved changes" : @"")
+                kind:working ? StatusWorking : (self.dirty ? StatusUnsaved : StatusIdle)];
 }
 
 - (IBAction)save:(id)sender {
+    if (self.busy) return;
     NSString *name = Trim(self.nameField.stringValue);
     if (name.length == 0) {
         [self showError:@"Name is required."];
@@ -561,58 +637,71 @@ static void InstallMainMenu(void) {
     if (service.length == 0) service = name;
     if (account.length == 0) account = NSUserName();
 
-    int status = 0;
-    NSString *output = nil;
-    if (secret.length > 0) {
-        output = RunTool(@[@"put", name, @"--stdin", @"--env", envName, @"--service", service, @"--account", account, @"--note", note], secret, &status);
-    } else {
-        output = RunTool(@[@"update", name, @"--env", envName, @"--service", service, @"--account", account, @"--note", note], nil, &status);
-    }
-    if (status != 0) {
-        [self showError:output];
+    if (!self.editingName && self.metadata[name]) {
+        [self showError:@"This name already exists. Select the existing entry to edit it."];
         return;
     }
-    self.nameField.editable = NO;
-    [self resetSecretFields];
-    [self refresh:nil];
-    NSUInteger index = [self.names indexOfObject:name];
-    if (index != NSNotFound) {
-        [self.table selectRowIndexes:[NSIndexSet indexSetWithIndex:index] byExtendingSelection:NO];
+    if (!self.editingName && secret.length == 0) {
+        [self showError:@"A secret value is required for a new entry."];
+        return;
     }
-    self.statusLabel.stringValue = [NSString stringWithFormat:@"Saved %@", name];
+    NSDictionary *entry = @{@"env": envName, @"service": service, @"account": account,
+                            @"note": note, @"keychain": self.keychainPath ?: DefaultKeychainPath()};
+    NSString *indexPath = IndexPath();
+    BOOL creating = self.editingName == nil;
+    [self setWorking:YES message:@"Saving to Keychain…"];
+    RunStore(^NSString *(NSError **error) {
+        SaveSecretEntry(indexPath, name, entry, secret.length ? secret : nil, creating, error);
+        return nil;
+    }, ^(NSString *value __unused, NSError *error) {
+        [self setWorking:NO message:@""];
+        if (error) { [self showError:error.localizedDescription]; return; }
+        self.dirty = NO;
+        self.editingName = name;
+        [self refresh:nil];
+        [self loadEntry:name];
+        [self showStatus:@"Changes saved" kind:StatusSuccess];
+    });
 }
 
 - (IBAction)deleteEntry:(id)sender {
-    NSString *name = Trim(self.nameField.stringValue);
-    if (name.length == 0) {
-        [self showError:@"Select an entry to delete."];
-        return;
-    }
+    if (self.busy) return;
+    NSString *name = self.editingName;
+    if (!name) { [self showError:@"Select a saved entry to delete."]; return; }
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = [NSString stringWithFormat:@"Delete %@?", name];
-    alert.informativeText = @"This removes the Keychain item and metadata.";
-    [alert addButtonWithTitle:@"Delete"];
+    alert.informativeText = @"This permanently removes the Keychain value and its metadata, including any unsaved changes.";
     [alert addButtonWithTitle:@"Cancel"];
-    if ([alert runModal] != NSAlertFirstButtonReturn) {
-        return;
-    }
-    int status = 0;
-    NSString *output = RunTool(@[@"delete", name], nil, &status);
-    if (status != 0) {
-        [self showError:output];
-        return;
-    }
-    [self refresh:nil];
-    [self newEntry:nil];
+    [alert addButtonWithTitle:@"Delete Secret"];
+    if ([alert runModal] != NSAlertSecondButtonReturn) return;
+    [self setWorking:YES message:@"Deleting from Keychain…"];
+    NSString *indexPath = IndexPath();
+    RunStore(^NSString *(NSError **error) {
+        DeleteSecretEntry(indexPath, name, error);
+        return nil;
+    }, ^(NSString *value __unused, NSError *error) {
+        [self setWorking:NO message:@""];
+        if (error) { [self showError:error.localizedDescription]; return; }
+        self.dirty = NO;
+        [self newEntry:nil];
+        [self refresh:nil];
+        [self showStatus:@"Secret deleted" kind:StatusSuccess];
+    });
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem *)item {
+    if (item.action == @selector(focusSearch:)) return YES;
+    if (item.action == @selector(save:) || item.action == @selector(newEntry:) || item.action == @selector(refresh:)) return !self.busy;
+    return YES;
 }
 
 - (void)showError:(NSString *)message {
     NSAlert *alert = [[NSAlert alloc] init];
     alert.alertStyle = NSAlertStyleWarning;
-    alert.messageText = @"Keychain Secrets";
+    alert.messageText = @"Clinklet";
     alert.informativeText = message ?: @"Unknown error";
+    [self showStatus:message ?: @"Unknown error" kind:StatusError];
     [alert runModal];
-    self.statusLabel.stringValue = message ?: @"Unknown error";
 }
 
 - (void)resetSecretFields {
@@ -624,71 +713,59 @@ static void InstallMainMenu(void) {
     self.secretToggleButton.title = @"Show";
 }
 
-- (NSString *)currentSecretValue {
-    NSString *typedSecret = self.secretVisible ? self.secretVisibleField.stringValue : self.secretField.stringValue;
-    if (typedSecret.length > 0) {
-        return typedSecret;
-    }
-
-    NSString *name = Trim(self.nameField.stringValue);
-    if (name.length == 0 || self.nameField.editable) {
-        return @"";
-    }
-
-    int status = 0;
-    NSString *service = Trim(self.serviceField.stringValue);
-    NSString *account = Trim(self.accountField.stringValue);
-    NSString *keychain = self.keychainPath.length > 0 ? self.keychainPath : DefaultKeychainPath();
-    if (service.length == 0) service = name;
-    if (account.length == 0) account = NSUserName();
-    NSString *output = RunSecurity(@[@"find-generic-password", @"-a", account, @"-s", service, @"-w", keychain], &status);
-    if (status != 0) {
-        [self showError:output];
-        return nil;
-    }
-    return Trim(output);
+- (void)readCurrentSecret:(void (^)(NSString *))completion {
+    if (self.busy) return;
+    NSString *typed = self.secretVisible ? self.secretVisibleField.stringValue : self.secretField.stringValue;
+    if (typed.length > 0) { completion(typed); return; }
+    NSString *name = self.editingName;
+    if (!name) { [self showError:@"Enter a secret value first."]; return; }
+    // Read the persisted identity, even if the form contains unsaved service/account edits.
+    NSString *service = [self field:@"service" forName:name fallback:name];
+    NSString *account = [self field:@"account" forName:name fallback:NSUserName()];
+    NSString *keychain = [self field:@"keychain" forName:name fallback:DefaultKeychainPath()];
+    NSUInteger generation = self.selectionGeneration;
+    [self setWorking:YES message:@"Waiting for Keychain…"];
+    NSDictionary *entry = @{@"service": service, @"account": account, @"keychain": keychain};
+    RunStore(^NSString *(NSError **error) { return ReadSecretValue(entry, error); }, ^(NSString *output, NSError *error) {
+        [self setWorking:NO message:@""];
+        if (generation != self.selectionGeneration) return;
+        if (error) { [self showError:error.localizedDescription]; return; }
+        completion(output);
+    });
 }
 
 - (IBAction)toggleSecret:(id)sender {
+    if (self.busy) return;
     if (self.secretVisible) {
         self.secretField.stringValue = self.secretVisibleField.stringValue;
+        self.secretVisibleField.stringValue = @"";
         self.secretVisibleField.hidden = YES;
         self.secretField.hidden = NO;
         self.secretVisible = NO;
         self.secretToggleButton.title = @"Show";
         return;
     }
-
-    NSString *typedSecret = [self currentSecretValue];
-    if (typedSecret == nil) {
-        return;
-    }
-
-    self.secretVisibleField.stringValue = typedSecret;
-    self.secretField.hidden = YES;
-    self.secretVisibleField.hidden = NO;
-    self.secretVisible = YES;
-    self.secretToggleButton.title = @"Hide";
+    [self readCurrentSecret:^(NSString *value) {
+        self.secretVisibleField.stringValue = value;
+        self.secretField.hidden = YES;
+        self.secretVisibleField.hidden = NO;
+        self.secretVisible = YES;
+        self.secretToggleButton.title = @"Hide";
+    }];
 }
 
 - (IBAction)copySecret:(id)sender {
-    NSString *secret = [self currentSecretValue];
-    if (secret == nil) {
-        return;
-    }
-    if (secret.length == 0) {
-        [self showError:@"No secret value to copy."];
-        return;
-    }
-    NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
-    [pasteboard clearContents];
-    [pasteboard setString:secret forType:NSPasteboardTypeString];
-    self.statusLabel.stringValue = @"Secret copied to clipboard";
+    [self readCurrentSecret:^(NSString *value) {
+        NSPasteboard *pasteboard = NSPasteboard.generalPasteboard;
+        [pasteboard clearContents];
+        [pasteboard setString:value forType:NSPasteboardTypeString];
+        [self showStatus:@"Copied to clipboard" kind:StatusSuccess];
+    }];
 }
 
 @end
 
-int main(int argc, const char *argv[]) {
+int main(void) {
     @autoreleasepool {
         NSApplication *app = [NSApplication sharedApplication];
         InstallMainMenu();

@@ -4,10 +4,10 @@ description: Manage local API keys and other secrets for AI agents using macOS K
 allowed-tools: Bash, Read, Write
 metadata:
   short-description: Manage agent secrets via macOS Keychain
-  compatibility: macOS 13+ (requires `/usr/bin/security` and Python 3.9+); the native app additionally requires Xcode Command Line Tools to build
+  compatibility: macOS 13+ (requires `/usr/bin/security` and Python 3.9+); the native release app needs no Python; source builds require Xcode Command Line Tools
 ---
 
-# Keychain Secrets
+# Clinklet (Keychain Secrets CLI)
 
 Use this skill to manage local secrets for agent workflows. The durable secret value must live in macOS Keychain; metadata such as env var name and notes may live in the skill index.
 
@@ -38,8 +38,8 @@ The index does not contain secret values.
 ## Repository Layout
 
 - `scripts/keychain_secrets.py` — the CLI entry point. Wraps `/usr/bin/security` for Keychain reads/writes and serves the optional web UI.
-- `scripts/install_macos_app.sh` — builds and installs the native `KeychainSecrets.app` bundle. Invoked by `keychain_secrets.py app`.
-- `macos/KeychainSecretsApp.m` — source for the native macOS app (Cocoa). Shells out to `keychain_secrets.py` for all Keychain operations so there is one source of truth.
+- `scripts/install_macos_app.sh` — builds and installs the native `Clinklet.app` bundle. Invoked by `keychain_secrets.py app`.
+- `macos/KeychainSecretsApp.m` — source for the native macOS app (Cocoa). Uses `SecretStore.m` and Security.framework directly; no Python is needed by the desktop app. The CLI uses the same Keychain item identity and metadata schema.
 - `agents/openai.yaml` — agent-interface manifest. Declares the skill's display name, short description, default prompt, and invocation policy so Codex / OpenAI-Agent-style runtimes can discover and auto-invoke the skill. Not needed for Claude Code, which reads the frontmatter of this file.
 - `docs/` — documentation assets (screenshots, etc.) referenced by `README.md`.
 - No `package.json` exists. This skill is pure Python (stdlib only) plus an Objective-C app; there are no npm or pip dependencies to install.
@@ -87,7 +87,7 @@ Why: removes both the Keychain item and the index entry in one step so the two c
 Run a command with one or more secrets injected as environment variables:
 
 ```bash
-python scripts/keychain_secrets.py run OPENAI_API_KEY -- env | grep OPENAI_API_KEY
+python scripts/keychain_secrets.py run OPENAI_API_KEY -- python3 your_script.py
 ```
 
 Why this is the preferred form: the secret is fetched from Keychain and handed directly to the child process's environment. It never appears on the command line, in shell history, or in this chat — only the child process sees it. Reach for this whenever the goal is "let this command see the key".
@@ -119,13 +119,13 @@ python scripts/keychain_secrets.py app
 Why prefer the native app over the web UI: no localhost port, no background service, and Keychain access happens in the app's own process so macOS prompts the user with a recognizable bundle name. The app is installed at:
 
 ```text
-~/Applications/KeychainSecrets.app
+~/Applications/Clinklet.app
 ```
 
 You can open it later from Finder, Spotlight, or:
 
 ```bash
-open "$HOME/Applications/KeychainSecrets.app"
+open "$HOME/Applications/Clinklet.app"
 ```
 
 Start the legacy local web UI when a browser-based fallback is useful:
