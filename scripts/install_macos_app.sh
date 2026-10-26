@@ -2,16 +2,22 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_DIR="${HOME}/Applications/KeychainSecrets.app"
-OLD_APP_DIR="${HOME}/Applications/Keychain Secrets.app"
-CONTENTS_DIR="${APP_DIR}/Contents"
+APP_DIR="${KEYCHAIN_SECRETS_APP_DIR:-${HOME}/Applications/KeychainSecrets.app}"
+mkdir -p "$(dirname "${APP_DIR}")"
+STAGING_DIR="$(mktemp -d "$(dirname "${APP_DIR}")/.keychain-secrets-build.XXXXXX")"
+PREVIOUS_DIR="${STAGING_DIR}/previous.app"
+cleanup() {
+  if [[ -d "${PREVIOUS_DIR}" && ! -e "${APP_DIR}" ]]; then
+    mv "${PREVIOUS_DIR}" "${APP_DIR}"
+  fi
+  rm -rf "${STAGING_DIR}"
+}
+trap cleanup EXIT
+CONTENTS_DIR="${STAGING_DIR}/KeychainSecrets.app/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
 RESOURCES_DIR="${CONTENTS_DIR}/Resources"
 BINARY_PATH="${MACOS_DIR}/KeychainSecrets"
 ICONSET_DIR="${RESOURCES_DIR}/KeychainSecrets.iconset"
-
-rm -rf "${OLD_APP_DIR}"
-rm -rf "${APP_DIR}"
 mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 
 clang \
@@ -157,9 +163,9 @@ cat > "${CONTENTS_DIR}/Info.plist" <<'PLIST'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.0</string>
+  <string>1.1</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>2</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>
@@ -168,4 +174,7 @@ cat > "${CONTENTS_DIR}/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
+# Publish only a fully built bundle; restore the previous installation if publishing fails.
+if [[ -e "${APP_DIR}" ]]; then mv "${APP_DIR}" "${PREVIOUS_DIR}"; fi
+mv "${STAGING_DIR}/KeychainSecrets.app" "${APP_DIR}"
 echo "${APP_DIR}"
